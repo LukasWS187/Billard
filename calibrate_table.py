@@ -182,6 +182,10 @@ def video_frame_picker(cap: cv2.VideoCapture, start_idx: int):
             print("Abgebrochen.")
             sys.exit(0)
     cv2.destroyWindow(win)
+    if frame is None:
+        print("FEHLER: Es konnte kein lesbares Frame aus dem Video geholt werden "
+              "(evtl. beschaedigte Datei oder ungewoehnliches Format).")
+        sys.exit(1)
     return frame
 
 
@@ -245,6 +249,49 @@ def main():
             if len(calib.points) != 4:
                 print(f"Es sind erst {len(calib.points)}/4 Punkte gesetzt.")
                 continue
+            # Sanity-Check 1: liegen zwei Punkte verdaechtig nah beieinander
+            # (z.B. Doppelklick-Verwackler)? Das wuerde eine entartete,
+            # unbrauchbare Perspektiv-Transformation erzeugen.
+            too_close = False
+            for i in range(4):
+                for j in range(i + 1, 4):
+                    dist = ((calib.points[i][0] - calib.points[j][0]) ** 2 +
+                            (calib.points[i][1] - calib.points[j][1]) ** 2) ** 0.5
+                    if dist < 15:
+                        print(f"WARNUNG: Punkt {i+1} und Punkt {j+1} liegen nur "
+                              f"{dist:.0f}px auseinander - vermutlich ein "
+                              f"Klickfehler. Mit 'r' zuruecknehmen und neu setzen.")
+                        too_close = True
+            if too_close:
+                continue
+
+            # Sanity-Check 2: wurden zwei Ecken in FALSCHER REIHENFOLGE geklickt
+            # (z.B. oben-rechts und unten-rechts vertauscht)? Das ergibt ein
+            # sich selbst ueberkreuzendes "Bowtie"-Viereck statt eines echten
+            # Rechtecks -- die Perspektiv-Transformation wird dann komplett
+            # unbrauchbar (getestet: das Ergebnisbild wird schlicht schwarz).
+            # Erkennung: die Flaeche des Vierecks IN DER GEKLICKTEN REIHENFOLGE
+            # (Shoelace-Formel) muss der Flaeche der konvexen Huelle derselben
+            # 4 Punkte entsprechen -- bei vertauschter Reihenfolge weichen
+            # beide deutlich voneinander ab.
+            pts_arr = np.array(calib.points, dtype=np.float32)
+            shoelace_area = 0.0
+            for i in range(4):
+                x1, y1 = pts_arr[i]
+                x2, y2 = pts_arr[(i + 1) % 4]
+                shoelace_area += x1 * y2 - x2 * y1
+            shoelace_area = abs(shoelace_area) / 2.0
+            hull = cv2.convexHull(pts_arr)
+            hull_area = cv2.contourArea(hull)
+            if hull_area > 0 and shoelace_area < 0.8 * hull_area:
+                print("WARNUNG: Die 4 Punkte scheinen in FALSCHER REIHENFOLGE "
+                      "geklickt zu sein (ueberkreuztes statt einfaches Viereck) "
+                      "- vermutlich wurden zwei Ecken vertauscht. Das wuerde die "
+                      "Kalibrierung unbrauchbar machen. Mit 'r' zuruecknehmen "
+                      "und in der Reihenfolge oben-links -> oben-rechts -> "
+                      "unten-rechts -> unten-links neu klicken.")
+                continue
+
             preview_warp(calib.frame, calib.points)
             confirm = input("Kalibrierung so speichern? (j/n): ").strip().lower()
             if confirm == "j":
