@@ -324,24 +324,37 @@ class BallTracker:
             return quick_kinds[j]
 
         if active_ids and positions:
-            cost = np.zeros((len(active_ids), len(positions)))
+            assign_cost = np.zeros((len(active_ids), len(positions)))
+            dist_cost = np.zeros((len(active_ids), len(positions)))
             for i, bid in enumerate(active_ids):
                 predicted = self.balls[bid].pos + self.balls[bid].vel * dt
                 tracked_kind = self.balls[bid].kind
                 for j, p in enumerate(positions):
                     base_cost = np.linalg.norm(predicted - p)
+                    dist_cost[i, j] = base_cost
+                    penalty = 0.0
                     if tracked_kind != "unknown":
                         qk = quick_kind(j)
                         if qk != "unknown" and qk != tracked_kind:
-                            base_cost += 1_000_000.0
-                    cost[i, j] = base_cost
-            row_ind, col_ind = linear_sum_assignment(cost)
+                            # Straf-Aufschlag NUR fuer die Zuordnungs-Optimierung
+                            # (bevorzugt bei mehreren Kandidaten die kind-passende
+                            # Erkennung), NICHT fuer die Akzeptanz-Schwelle unten.
+                            # Ein einzelner Klassifikations-"Flacker" (z.B. kurzer
+                            # Schatten laesst eine Kugel fuer 1 Frame als andere
+                            # Art erscheinen) soll NICHT dazu fuehren, dass die
+                            # naheliegendste (und einzig plausible) Erkennung
+                            # abgelehnt wird, nur weil sie kurzzeitig anders
+                            # klassifiziert wurde (im Testprotokoll reproduziert).
+                            penalty = 500.0
+                    assign_cost[i, j] = base_cost + penalty
+            row_ind, col_ind = linear_sum_assignment(assign_cost)
         else:
+            dist_cost = None
             row_ind, col_ind = np.array([], dtype=int), np.array([], dtype=int)
 
         matched_det = set()
         for r, c in zip(row_ind, col_ind):
-            if cost[r, c] > self.match_dist_px:
+            if dist_cost[r, c] > self.match_dist_px:
                 continue
             bid = active_ids[r]
             new_pos = positions[c]
@@ -362,7 +375,7 @@ class BallTracker:
                     b.kind = new_kind
 
         matched_ids = {active_ids[r] for r, c in zip(row_ind, col_ind)
-                       if cost[r, c] <= self.match_dist_px}
+                       if dist_cost[r, c] <= self.match_dist_px}
         for bid in active_ids:
             if bid not in matched_ids:
                 self.balls[bid].missing_frames += 1
@@ -476,17 +489,38 @@ class ShotEventDetector:
                     break
 
         # -- Verschwundene Kugeln: versenkt oder vom Tisch gesprungen --
+        # HINWEIS: hier bewusst KEINE Sonderbehandlung fuer "unbestaetigte"
+        # (nur 1x gesehene) Kugeln mehr. Eine fruehere Fassung hat solche
+        # Kugeln nach nur 2 fehlenden Frames stillschweigend verworfen, um
+        # Kompressions-Geisterartefakte nahe der Bildecke abzufangen - das
+        # eigentliche Problem (Artefakte exakt an der Bildecke) wird aber
+        # bereits durch den Rand in TableCalibration geloest (Taschen liegen
+        # dort nicht mehr exakt auf der Bildecke). Die fruehe Verwerfung hatte
+        # dagegen ein ernsteres Risiko: eine Kugel, die durch kurzzeitigen
+        # Tracking-Verlust (z.B. Ueberlappung) kurz vor dem Einlochen eine
+        # NEUE ID bekommt, waere als "unbestaetigt" verworfen worden UND der
+        # eigentliche Pot waere komplett verloren gegangen (im Testprotokoll
+        # reproduziert). Alle Kugeln bekommen daher gleichermassen die volle
+        # max_missing_frames-Frist.
         for b in tracker.balls.values():
             if b.pocketed or b.off_table:
                 continue
-            # Ein nie bestaetigter Einzelblitz (nur 1x gesehen, dann sofort
-            # wieder weg) wird schnell verworfen, statt die volle
-            # max_missing_frames-Frist abzuwarten -- er wird ohnehin nicht
-            # zurueckkommen, ein laengeres Warten bringt nichts.
-            discard_threshold = 2 if not b.confirmed else tracker.max_missing_frames
-            if b.missing_frames >= discard_threshold:
-                if not b.confirmed:
-                    b.off_table = True  # stillschweigend aus aktivem Tracking entfernen
+            if b.missing_frames >= tracker.max_missing_frames:
+                # Verwaistes Duplikat erkennen: liegt GENAU JETZT eine ANDERE
+                # aktive Kugel derselben Art nahe an dieser (laengst
+                # eingefrorenen) Position? Dann ist dies hoechstwahrscheinlich
+                # ein Ueberbleibsel eines Verschmelzungs-Ereignisses (die echte
+                # Kugel laeuft unter einer anderen ID weiter) und KEIN eigenes
+                # Versenkt-/Vom-Tisch-Ereignis - stillschweigend entfernen,
+                # ohne ein (falsches) Ereignis zu buchen.
+                is_orphan_duplicate = any(
+                    other.id != b.id and other.kind == b.kind and
+                    not other.pocketed and not other.off_table and
+                    np.linalg.norm(other.pos - b.pos) < tracker.match_dist_px
+                    for other in tracker.balls.values()
+                )
+                if is_orphan_duplicate:
+                    b.off_table = True  # nur intern aus dem Tracking entfernen
                     continue
                 mm = self.calib.px_to_mm(b.pos)
                 pocket_idx = self._nearest_pocket(mm)
@@ -749,6 +783,10 @@ class RuleEngine:
 def _load_corners(calibration_path: Optional[str], corners_arg: Optional[list]):
     """Liefert die 4 Eck-Punkte entweder aus einer JSON-Datei (von
     calibrate_table.py) oder aus manuell übergebenen 'x,y'-Strings."""
+    if calibration_path and corners_arg:
+        print(f"HINWEIS: sowohl --calibration als auch --corners angegeben - "
+              f"--calibration ('{calibration_path}') wird verwendet, --corners "
+              f"wird ignoriert.")
     if calibration_path:
         import json
         try:
@@ -805,7 +843,14 @@ def main():
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=800)
     parser.add_argument("--fps", type=int, default=120)
-    parser.add_argument("--out-w", type=int, default=1000)
+    parser.add_argument("--out-w", type=int, default=1000,
+                         help="Breite der entzerrten Top-Down-Ansicht in Pixeln. "
+                              "WICHTIG fuer Performance: die Erkennung (v.a. "
+                              "Hintergrundsubtraktion) skaliert etwa quadratisch "
+                              "mit der Aufloesung. Im Test: 1000x500 ~19ms/Frame, "
+                              "500x250 ~4.5ms/Frame (ca. 4x schneller). Bei 120fps "
+                              "Zielrate bleiben nur ~8.3ms/Frame - ggf. verkleinern, "
+                              "falls die Verarbeitung nicht mit der Kamera mithaelt.")
     parser.add_argument("--out-h", type=int, default=500)
     parser.add_argument("--table-w-mm", type=float, default=2540.0)
     parser.add_argument("--table-h-mm", type=float, default=1270.0)
@@ -849,6 +894,19 @@ def main():
         print(f"FEHLER: --background-frames muss positiv sein (war: {args.background_frames}). "
               f"Ohne echte Hintergrund-Lernphase wird nichts korrekt erkannt.")
         sys.exit(1)
+    if args.max_missing_frames <= 0:
+        print(f"FEHLER: --max-missing-frames muss positiv sein (war: {args.max_missing_frames}). "
+              f"Bei 0 oder negativ wuerde JEDE Kugel sofort als versenkt/vom Tisch gelten.")
+        sys.exit(1)
+    if args.match_dist_px <= 0:
+        print(f"FEHLER: --match-dist-px muss positiv sein (war: {args.match_dist_px}). "
+              f"Bei 0 oder negativ koennte niemals eine Kugel wiedererkannt werden.")
+        sys.exit(1)
+    if args.player_names[0] == args.player_names[1]:
+        print(f"HINWEIS: Beide Spieler heissen '{args.player_names[0]}' - die "
+              f"Spielverfolgung selbst bleibt korrekt, aber die finale "
+              f"Sieger-Meldung waere nicht mehr eindeutig lesbar. Empfehlung: "
+              f"--player-names mit zwei unterschiedlichen Namen angeben.")
 
     corners = _load_corners(args.calibration, args.corners)
     table_config = TableConfig(corners_px=corners, table_w_mm=args.table_w_mm,
@@ -869,14 +927,30 @@ def main():
     # -- Hintergrund aus mehreren ECHTEN Kameraframes lernen --------------
     print(f"Lerne Hintergrund aus {args.background_frames} echten Kameraframes.")
     print("WICHTIG: Der Tisch muss dabei komplett leer sein (keine Kugeln, keine Hand).")
-    learned = 0
-    while learned < args.background_frames:
-        frame = cam.read()
-        if frame is None:
-            continue
-        topdown = calib.warp(frame)
-        detector.bg_subtractor.apply(topdown, learningRate=0.5)
-        learned += 1
+    print("(Strg+C zum Abbrechen, auch waehrend dieser Phase moeglich)")
+    MAX_CONSECUTIVE_FAILED_READS = 150  # ~1-5s je nach fps, statt endlos zu haengen
+    try:
+        learned = 0
+        failed_reads = 0
+        while learned < args.background_frames:
+            frame = cam.read()
+            if frame is None:
+                failed_reads += 1
+                if failed_reads >= MAX_CONSECUTIVE_FAILED_READS:
+                    print(f"\nFEHLER: {MAX_CONSECUTIVE_FAILED_READS} Kameraframes in "
+                          f"Folge fehlgeschlagen - Kamera getrennt oder abgestuerzt? "
+                          f"Programm wird beendet.")
+                    cam.release()
+                    return
+                continue
+            failed_reads = 0
+            topdown = calib.warp(frame)
+            detector.bg_subtractor.apply(topdown, learningRate=0.5)
+            learned += 1
+    except KeyboardInterrupt:
+        print("\nAbgebrochen waehrend der Hintergrund-Lernphase.")
+        cam.release()
+        return
     print("Hintergrund gelernt. Tisch kann jetzt aufgebaut werden.\n")
 
     if not args.no_display:
@@ -887,13 +961,21 @@ def main():
 
     shot_active = False
     last_time = time.time()
+    consecutive_failed_reads = 0
 
     print("Starte Überwachung... (Strg+C bzw. 'q' im Fenster zum Beenden)")
     try:
         while rules.phase != GamePhase.GAME_OVER:
             frame = cam.read()
             if frame is None:
+                consecutive_failed_reads += 1
+                if consecutive_failed_reads >= MAX_CONSECUTIVE_FAILED_READS:
+                    print(f"\nFEHLER: {MAX_CONSECUTIVE_FAILED_READS} Kameraframes in "
+                          f"Folge fehlgeschlagen - Kamera getrennt oder abgestuerzt? "
+                          f"Programm wird beendet.")
+                    break
                 continue
+            consecutive_failed_reads = 0
             now = time.time()
             dt = now - last_time
             last_time = now

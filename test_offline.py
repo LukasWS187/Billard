@@ -57,6 +57,10 @@ KIND_COLORS = {
 
 
 def parse_corners(args) -> list:
+    if args.calibration and args.corners:
+        print(f"HINWEIS: sowohl --calibration als auch --corners angegeben - "
+              f"--calibration ('{args.calibration}') wird verwendet, --corners "
+              f"wird ignoriert.")
     if args.calibration:
         try:
             with open(args.calibration, "r", encoding="utf-8") as f:
@@ -128,7 +132,10 @@ def main():
                          help="JSON-Datei aus calibrate_table.py")
     parser.add_argument("--corners", nargs=4, default=None,
                          help="4 Punkte manuell, Format x,y (falls keine --calibration)")
-    parser.add_argument("--out-w", type=int, default=1000)
+    parser.add_argument("--out-w", type=int, default=1000,
+                         help="Breite der entzerrten Top-Down-Ansicht. Skaliert "
+                              "stark auf die Erkennungsgeschwindigkeit, siehe "
+                              "pool_referee.py --help fuer Messwerte.")
     parser.add_argument("--out-h", type=int, default=500)
     parser.add_argument("--table-w-mm", type=float, default=2540.0)
     parser.add_argument("--table-h-mm", type=float, default=1270.0)
@@ -161,6 +168,14 @@ def main():
     if args.background_frames <= 0:
         print(f"FEHLER: --background-frames muss positiv sein (war: {args.background_frames}). "
               f"Ohne echte Hintergrund-Lernphase wird nichts korrekt erkannt.")
+        sys.exit(1)
+    if args.max_missing_frames <= 0:
+        print(f"FEHLER: --max-missing-frames muss positiv sein (war: {args.max_missing_frames}). "
+              f"Bei 0 oder negativ wuerde JEDE Kugel sofort als versenkt/vom Tisch gelten.")
+        sys.exit(1)
+    if args.match_dist_px <= 0:
+        print(f"FEHLER: --match-dist-px muss positiv sein (war: {args.match_dist_px}). "
+              f"Bei 0 oder negativ koennte niemals eine Kugel wiedererkannt werden.")
         sys.exit(1)
 
     corners = parse_corners(args)
