@@ -68,11 +68,49 @@ class TableConfig:
     table_h_mm: float = 1270.0
     ball_diameter_mm: float = 57.15
     pocket_radius_mm: float = 65.0
-    # Taschenpositionen in Tisch-Koordinaten (mm), Ursprung oben-links:
-    pocket_positions_mm: list = field(default_factory=lambda: [
-        (0, 0), (1270, -20), (2540, 0),          # obere Bande (3 Taschen)
-        (0, 1270), (1270, 1290), (2540, 1270),   # untere Bande (3 Taschen)
-    ])
+    # Nur fuer nicht-standardmaessige Taschenanordnungen setzen (z.B. exotische
+    # Tischformen). Im Normalfall None lassen - dann werden die 6 Taschen
+    # automatisch aus table_w_mm/table_h_mm berechnet (siehe Property unten).
+    pocket_positions_mm_override: Optional[list] = None
+
+    @property
+    def pocket_positions_mm(self) -> list:
+        """6 Taschenpositionen in Tisch-Koordinaten (mm), Ursprung oben-links.
+        Wird aus table_w_mm/table_h_mm abgeleitet, damit sie bei einem
+        abweichend konfigurierten Tisch (z.B. 9-Fuss statt 8-Fuss, oder
+        vertauschten Massen fuer eine Hochkant-Kalibrierung) automatisch
+        mitskalieren, statt auf den 8-Fuss-Standardwerten stehen zu bleiben
+        (frueherer Fehler: bei geaendertem table_w_mm/table_h_mm blieben die
+        Taschen faelschlich an den alten, festen Koordinaten haengen).
+
+        WICHTIG: Die beiden Seitentaschen liegen bei einem echten Billardtisch
+        immer auf den LANGEN Banden, an deren Mittelpunkt - NIE auf den
+        kurzen Banden. Welche der beiden Achsen (table_w_mm oder table_h_mm)
+        die lange ist, haengt davon ab, wie kalibriert wurde (Querformat:
+        table_w_mm ist die Laenge; Hochformat: table_h_mm ist die Laenge) -
+        das wird hier automatisch anhand des groesseren Wertes erkannt,
+        statt table_w_mm immer als Laengsachse anzunehmen (frueherer Fehler:
+        bei einer Hochformat-Kalibrierung landeten die Seitentaschen dadurch
+        faelschlich auf den kurzen statt den langen Banden)."""
+        if self.pocket_positions_mm_override is not None:
+            return self.pocket_positions_mm_override
+        w, h = self.table_w_mm, self.table_h_mm
+        if w >= h:
+            # Querformat: w ist die Laengsachse, Seitentaschen mittig auf
+            # der oberen/unteren (kurzen) Bandenrichtung ragend.
+            overhang = h * 0.0157
+            return [
+                (0, 0), (w / 2, -overhang), (w, 0),
+                (0, h), (w / 2, h + overhang), (w, h),
+            ]
+        else:
+            # Hochformat: h ist die Laengsachse, Seitentaschen mittig auf
+            # der linken/rechten (kurzen) Bandenrichtung ragend.
+            overhang = w * 0.0157
+            return [
+                (0, 0), (-overhang, h / 2), (0, h),
+                (w, 0), (w + overhang, h / 2), (w, h),
+            ]
 
 
 # ============================================================================
@@ -91,14 +129,28 @@ class OV9281Capture:
                  use_picamera2: bool = False):
         self.use_picamera2 = use_picamera2
         if use_picamera2:
-            from picamera2 import Picamera2  # type: ignore
-            self.cam = Picamera2()
-            config = self.cam.create_video_configuration(
-                main={"size": (width, height), "format": "RGB888"},
-                controls={"FrameRate": fps},
-            )
-            self.cam.configure(config)
-            self.cam.start()
+            try:
+                from picamera2 import Picamera2  # type: ignore
+                self.cam = Picamera2()
+                config = self.cam.create_video_configuration(
+                    main={"size": (width, height), "format": "RGB888"},
+                    controls={"FrameRate": fps},
+                )
+                self.cam.configure(config)
+                self.cam.start()
+            except ImportError:
+                raise RuntimeError(
+                    "picamera2-Bibliothek nicht installiert. Auf dem "
+                    "Raspberry Pi installieren mit: pip install picamera2 "
+                    "--break-system-packages (oder ueber apt: "
+                    "sudo apt install python3-picamera2)."
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"CSI-Kamera konnte nicht gestartet werden: {e}. Ist die "
+                    f"Kamera korrekt am Raspberry Pi angeschlossen und in "
+                    f"raspi-config aktiviert?"
+                )
         else:
             self.cam = cv2.VideoCapture(device_index, cv2.CAP_V4L2)
             self.cam.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -162,6 +214,17 @@ class TableCalibration:
         self.scale_y = config.table_h_mm / (out_h - 2 * self.margin_y)
 
     def warp(self, frame: np.ndarray) -> np.ndarray:
+        # Manche Kamera-Backends/Bildquellen liefern 4 Kanaele (BGRA) statt
+        # der erwarteten 3 (BGR) - z.B. bestimmte Aufnahmepfade oder Bilder
+        # mit Alpha-Kanal. Ein 4-Kanal-Bild hat ebenfalls ndim==3 (ndim
+        # zaehlt nur Achsen, nicht Kanaele!), wuerde also spaeter in
+        # BallDetector.detect() faelschlich durch die BGR2GRAY-Konvertierung
+        # laufen und ein fast komplett schwarzes, unbrauchbares Ergebnis
+        # erzeugen (im Testprotokoll reproduziert) - hier normalisieren,
+        # BEVOR irgendetwas Nachgelagertes (Hintergrundlernen, Erkennung)
+        # das Bild zu Gesicht bekommt.
+        if frame.ndim == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
         return cv2.warpPerspective(frame, self.H, (self.out_w, self.out_h))
 
     def px_to_mm(self, pt_px: np.ndarray) -> np.ndarray:
@@ -365,11 +428,21 @@ class BallTracker:
             b.missing_frames = 0
             b.frames_seen += 1
             matched_det.add(c)
-            if b.kind == "unknown":
-                # Erneuter Klassifikationsversuch: die allererste Erkennung
-                # (z.B. waehrend Bewegungsunschaerfe direkt nach dem Break)
-                # darf nicht dauerhaft "unknown" einfrieren, sonst loest diese
-                # Kugel bei JEDEM spaeteren Kontakt ein Foul aus.
+            # Nachklassifikation: nicht nur fuer "unknown", sondern fuer JEDE
+            # Kugel in ihren ersten Sichtungen (frames_seen < 5). Grund: eine
+            # Kugel kann beim ALLERERSTEN Erkennen konfident, aber FALSCH
+            # klassifiziert werden (z.B. die Weisse erscheint durch einen
+            # kurzen Schatten als "solid" statt "cue") - ohne diese
+            # Korrekturmoeglichkeit wuerde das dauerhaft haengen bleiben,
+            # weil eine bereits "sichere" (nicht-unknown) Klassifikation
+            # sonst nie wieder ueberprueft wird. Im Testprotokoll reproduziert:
+            # eine falsch als "solid" erkannte Weisse fuehrte dazu, dass
+            # cue_ball nie gefunden wird und JEDER Stoss der Partie faelschlich
+            # als "trifft nichts" (Foul) gemeldet wird. Nach den ersten 5
+            # Sichtungen wird die Klassifikation wie bisher final eingefroren,
+            # damit spaeteres Lichtflackern eine etablierte Kugel nicht mehr
+            # umklassifizieren kann.
+            if b.kind == "unknown" or b.frames_seen < 5:
                 new_kind = quick_kind(c)
                 if new_kind != "unknown":
                     b.kind = new_kind
@@ -480,7 +553,15 @@ class ShotEventDetector:
         # -- Erstkontakt der Weißen prüfen --
         if cue_ball is not None and not self._contact_registered:
             for b in tracker.balls.values():
-                if b.id == cue_ball.id or b.pocketed or b.off_table:
+                # b.kind == "cue" wird zusaetzlich zur gewaehlten cue_ball-ID
+                # ausgeschlossen: sollten durch eine Fehlklassifikation zwei
+                # Kugeln gleichzeitig als "cue" erkannt werden, wuerde ein
+                # Treffer auf die ZWEITE sonst faelschlich first_contact_kind
+                # ="cue" melden - ein Wert, der nie zu einer Gruppe passen
+                # kann und IMMER faelschlich ein Foul ausloesen wuerde. Ein
+                # zweiter "cue"-Kandidat ist per Definition ein
+                # Klassifikationsfehler, kein gueltiges Kontaktziel.
+                if b.id == cue_ball.id or b.kind == "cue" or b.pocketed or b.off_table:
                     continue
                 dist = np.linalg.norm(cue_ball.pos - b.pos)
                 if dist < self.contact_thresh_px and moved_since_last.get(b.id, False):
@@ -715,6 +796,16 @@ class RuleEngine:
         # Einmal legal versenkte Kugeln bleiben unten, auch wenn im selben
         # Stoss zusaetzlich gescratcht wird.
         if self.phase == GamePhase.OPEN_TABLE and pocketed_own:
+            distinct_kinds = {p[1] for p in pocketed_own}
+            if len(distinct_kinds) > 1:
+                self.notifier.send(
+                    "Hinweis: Beim offenen Tisch wurden im selben Stoß sowohl "
+                    "eine volle als auch eine gestreifte Kugel versenkt. Das "
+                    "Regelwerk legt hierfür keine eindeutige Reihenfolge fest "
+                    "-- es wird vereinfachend die zuerst erkannte Kugel für "
+                    "die Gruppenzuweisung verwendet. Bei Uneinigkeit bitte "
+                    "manuell klären."
+                )
             self._assign_groups_from_first_pot(pocketed_own[0][1])
         self._update_remaining_balls(events)
 
@@ -773,7 +864,14 @@ class RuleEngine:
                 continue
             for player in self.players:
                 if self._kind_matches_group(kind, player.group):
+                    was_positive = player.remaining_balls > 0
                     player.remaining_balls = max(0, player.remaining_balls - 1)
+                    if was_positive and player.remaining_balls == 0:
+                        self.notifier.send(
+                            f"{player.name} hat alle eigenen Kugeln versenkt! "
+                            f"Vor dem Stoss auf die 8 jetzt die Tasche ansagen "
+                            f"(Taste 1-6 im Live-Fenster)."
+                        )
 
 
 # ============================================================================
@@ -798,6 +896,12 @@ def _load_corners(calibration_path: Optional[str], corners_arg: Optional[list]):
             raise ValueError(
                 f"Kalibrierdatei '{calibration_path}' ist kein gültiges JSON "
                 f"(vermutlich beschädigt oder falsche Datei): {e}"
+            )
+        if "corners_px" not in data:
+            raise ValueError(
+                f"Kalibrierdatei '{calibration_path}' enthält keinen "
+                f"'corners_px'-Schlüssel - ist das wirklich eine von "
+                f"calibrate_table.py erzeugte Datei?"
             )
         pts = [tuple(p) for p in data["corners_px"]]
         if len(pts) != 4:
@@ -826,6 +930,62 @@ def _load_corners(calibration_path: Optional[str], corners_arg: Optional[list]):
             raise ValueError("--corners braucht genau 4 Punkte.")
         return pts
     raise ValueError("Entweder --calibration oder --corners angeben.")
+
+
+def _build_pocket_map_image(table_config: TableConfig) -> np.ndarray:
+    """Erzeugt eine kleine Uebersichtsgrafik des Tisches mit nummerierten
+    Taschen (1-6), passend zur Tastenbelegung im Live-Fenster. Dient nur
+    als visuelle Gedaechtnisstuetze, welche Zahl zu welcher physischen
+    Tasche gehoert - wird einmalig erzeugt und in einem eigenen kleinen
+    Fenster angezeigt.
+
+    WICHTIG: Die Grafik richtet sich automatisch nach dem tatsaechlich
+    konfigurierten table_w_mm/table_h_mm-Seitenverhaeltnis aus (Hoch- oder
+    Querformat), statt Querformat fest anzunehmen. Massgeblich ist, was du
+    bei der Kalibrierung tatsaechlich als 'oben-links' etc. angeklickt hast
+    - je nachdem faellt die Grafik quer (Laenge horizontal, Seitentaschen
+    oben-Mitte/unten-Mitte) oder hochkant (Laenge vertikal, Seitentaschen
+    Mitte-links/Mitte-rechts) aus. Die Positionen ergeben sich rein
+    geometrisch aus table_w_mm/table_h_mm - es wird nichts angenommen."""
+    margin = 20
+    long_side_px = 220   # Zielgroesse der laengeren Tischseite in Pixeln
+    is_landscape = table_config.table_w_mm >= table_config.table_h_mm
+    ratio = (min(table_config.table_w_mm, table_config.table_h_mm) /
+             max(table_config.table_w_mm, table_config.table_h_mm))
+    short_side_px = max(40, int(long_side_px * ratio))
+
+    if is_landscape:
+        table_rect_w, table_rect_h = long_side_px, short_side_px
+    else:
+        table_rect_w, table_rect_h = short_side_px, long_side_px
+
+    img_w = table_rect_w + 2 * margin
+    img_h = table_rect_h + 2 * margin + 20  # +20 fuer die Beschriftungszeile
+    img = np.full((img_h, img_w, 3), (40, 40, 40), dtype=np.uint8)
+
+    scale_x = table_rect_w / table_config.table_w_mm
+    scale_y = table_rect_h / table_config.table_h_mm
+
+    cv2.rectangle(img, (margin, margin),
+                  (margin + table_rect_w, margin + table_rect_h),
+                  (60, 140, 20), -1)
+    cv2.rectangle(img, (margin, margin),
+                  (margin + table_rect_w, margin + table_rect_h),
+                  (210, 210, 210), 2)
+
+    for idx, (mx, my) in enumerate(table_config.pocket_positions_mm):
+        px = margin + int(mx * scale_x)
+        py = margin + int(my * scale_y)
+        cv2.circle(img, (px, py), 10, (10, 10, 10), -1)
+        cv2.circle(img, (px, py), 10, (255, 255, 255), 1)
+        label = str(idx + 1)
+        tsize = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+        cv2.putText(img, label, (px - tsize[0] // 2, py + tsize[1] // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+
+    cv2.putText(img, "Tasten 1-6 = Tasche fuer die 8", (8, img_h - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
+    return img
 
 
 def main():
@@ -902,6 +1062,16 @@ def main():
         print(f"FEHLER: --match-dist-px muss positiv sein (war: {args.match_dist_px}). "
               f"Bei 0 oder negativ koennte niemals eine Kugel wiedererkannt werden.")
         sys.exit(1)
+    if args.out_w <= 0 or args.out_h <= 0:
+        print(f"FEHLER: --out-w/--out-h muessen positiv sein (waren: "
+              f"{args.out_w}/{args.out_h}).")
+        sys.exit(1)
+    if args.table_w_mm <= 0 or args.table_h_mm <= 0:
+        print(f"FEHLER: --table-w-mm/--table-h-mm muessen positiv sein (waren: "
+              f"{args.table_w_mm}/{args.table_h_mm}). Bei 0 oder negativ wuerden "
+              f"alle mm-Umrechnungen (Bandenkontakt, Taschenerkennung) stillschweigend "
+              f"falsch, ohne dass ein Fehler sichtbar wuerde.")
+        sys.exit(1)
     if args.player_names[0] == args.player_names[1]:
         print(f"HINWEIS: Beide Spieler heissen '{args.player_names[0]}' - die "
               f"Spielverfolgung selbst bleibt korrekt, aber die finale "
@@ -957,11 +1127,15 @@ def main():
         print("Tastenbelegung im Live-Fenster:")
         print("  1-6 = Tasche fuer die angesagte 8 waehlen (vor dem Stoss auf die 8)")
         print("  c   = Taschenansage zuruecksetzen")
+        pocket_map = _build_pocket_map_image(table_config)
+        cv2.imshow("Taschen-Uebersicht", pocket_map)
         print("  q   = Programm beenden\n")
 
     shot_active = False
     last_time = time.time()
     consecutive_failed_reads = 0
+    expected_dt = 1.0 / args.fps
+    last_lag_warning = 0.0
 
     print("Starte Überwachung... (Strg+C bzw. 'q' im Fenster zum Beenden)")
     try:
@@ -979,6 +1153,19 @@ def main():
             now = time.time()
             dt = now - last_time
             last_time = now
+
+            # Verarbeitung faellt hinter die Kamera-Framerate zurueck? Ein
+            # grosses dt wirkt auf das Tracking wie eine ploetzlich viel
+            # schnellere Kugel (siehe Testprotokoll: uebersprungene Frames
+            # genau waehrend eines Bandenabprallers koennen zur Fragmentierung
+            # fuehren) - hier max. alle 5s eine Warnung, keine Frame-fuer-
+            # Frame-Flut.
+            if dt > 3 * expected_dt and now - last_lag_warning > 5.0:
+                print(f"HINWEIS: Verarbeitung haengt hinterher ({dt*1000:.0f}ms "
+                      f"statt erwarteter {expected_dt*1000:.0f}ms pro Frame) - "
+                      f"evtl. --out-w/--out-h verkleinern, falls Kugeln bei "
+                      f"schnellen Stoessen falsch zugeordnet werden.")
+                last_lag_warning = now
 
             topdown = calib.warp(frame)
             detections = detector.detect(topdown)
@@ -1000,11 +1187,20 @@ def main():
 
             if not args.no_display:
                 display = topdown.copy()
+                remaining = rules.current_player.remaining_balls
                 status = (f"Phase={rules.phase.name}  Dran={rules.current_player.name}"
+                          f"  Eigene Kugeln uebrig={remaining if rules.current_player.group else '-'}"
                           f"  Angesagte Tasche(8)="
                           f"{rules.called_pocket_for_eight if rules.called_pocket_for_eight is not None else '-'}")
                 cv2.putText(display, status, (8, display.shape[0] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+                # Auffaellige Erinnerung: eigene Gruppe fertig, aber noch keine
+                # Tasche fuer die 8 angesagt -> jetzt waere der richtige Moment.
+                if (remaining == 0 and rules.current_player.group is not None and
+                        rules.called_pocket_for_eight is None):
+                    cv2.putText(display, "JETZT TASCHE FUER DIE 8 ANSAGEN (1-6)!",
+                                (8, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (0, 0, 255), 2, cv2.LINE_AA)
                 cv2.imshow("Live-Ueberwachung 8-Ball", display)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):

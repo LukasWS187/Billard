@@ -72,6 +72,11 @@ def parse_corners(args) -> list:
             print(f"FEHLER: Kalibrierdatei '{args.calibration}' ist kein gültiges "
                   f"JSON (vermutlich beschädigt oder falsche Datei): {e}")
             sys.exit(1)
+        if "corners_px" not in data:
+            print(f"FEHLER: Kalibrierdatei '{args.calibration}' enthält keinen "
+                  f"'corners_px'-Schlüssel - ist das wirklich eine von "
+                  f"calibrate_table.py erzeugte Datei?")
+            sys.exit(1)
         pts = [tuple(p) for p in data["corners_px"]]
         if len(pts) != 4:
             print(f"FEHLER: Kalibrierdatei enthält {len(pts)} Punkte statt der "
@@ -177,6 +182,15 @@ def main():
         print(f"FEHLER: --match-dist-px muss positiv sein (war: {args.match_dist_px}). "
               f"Bei 0 oder negativ koennte niemals eine Kugel wiedererkannt werden.")
         sys.exit(1)
+    if args.out_w <= 0 or args.out_h <= 0:
+        print(f"FEHLER: --out-w/--out-h muessen positiv sein (waren: "
+              f"{args.out_w}/{args.out_h}).")
+        sys.exit(1)
+    if args.table_w_mm <= 0 or args.table_h_mm <= 0:
+        print(f"FEHLER: --table-w-mm/--table-h-mm muessen positiv sein (waren: "
+              f"{args.table_w_mm}/{args.table_h_mm}). Bei 0 oder negativ wuerden "
+              f"alle mm-Umrechnungen stillschweigend falsch, ohne sichtbaren Fehler.")
+        sys.exit(1)
 
     corners = parse_corners(args)
     table_config = TableConfig(corners_px=corners, table_w_mm=args.table_w_mm,
@@ -187,7 +201,12 @@ def main():
     if not cap.isOpened():
         print(f"FEHLER: Video konnte nicht geoeffnet werden: {args.video}")
         sys.exit(1)
-    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    src_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not src_fps or src_fps != src_fps or src_fps <= 0:  # src_fps!=src_fps erkennt NaN
+        print(f"HINWEIS: Video meldet keine brauchbare fps ({src_fps}) - verwende "
+              f"ersatzweise 30.0. Falls die echte fps abweicht, --background-frames "
+              f"und Timing-Erwartungen ggf. anpassen.")
+        src_fps = 30.0
 
     detector = BallDetector(ball_radius_px=args.ball_radius_px)
     tracker = BallTracker(max_missing_frames=args.max_missing_frames,
@@ -221,6 +240,12 @@ def main():
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(args.save_annotated, fourcc, src_fps,
                                   (args.out_w, args.out_h))
+        if not writer.isOpened():
+            print(f"FEHLER: --save-annotated Datei konnte nicht angelegt werden: "
+                  f"'{args.save_annotated}'. Existiert der Zielordner? Programm "
+                  f"wird trotzdem fortgesetzt, aber OHNE annotiertes Video zu "
+                  f"speichern.")
+            writer = None
 
     shot_active = False
     last_time = time.time()

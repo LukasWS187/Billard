@@ -116,23 +116,34 @@ def grab_frame(args):
         if not cap.isOpened():
             print(f"FEHLER: Video konnte nicht geoeffnet werden: {args.video}")
             sys.exit(1)
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        raw_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        total = int(raw_count) if raw_count == raw_count and raw_count > 0 else 0  # raw_count!=raw_count erkennt NaN
         idx = min(total // 2, total - 1) if total > 0 else 0  # mittleren Frame als Start
         frame = video_frame_picker(cap, idx)
         cap.release()
         return frame
 
     if args.picamera2:
-        from picamera2 import Picamera2  # type: ignore
-        cam = Picamera2()
-        config = cam.create_still_configuration(
-            main={"size": (args.width, args.height), "format": "RGB888"}
-        )
-        cam.configure(config)
-        cam.start()
-        frame = cam.capture_array()
-        cam.stop()
-        return frame
+        try:
+            from picamera2 import Picamera2  # type: ignore
+            cam = Picamera2()
+            config = cam.create_still_configuration(
+                main={"size": (args.width, args.height), "format": "RGB888"}
+            )
+            cam.configure(config)
+            cam.start()
+            frame = cam.capture_array()
+            cam.stop()
+            return frame
+        except ImportError:
+            print("FEHLER: picamera2-Bibliothek nicht installiert. Installieren "
+                  "mit: pip install picamera2 --break-system-packages (oder ueber "
+                  "apt: sudo apt install python3-picamera2).")
+            sys.exit(1)
+        except Exception as e:
+            print(f"FEHLER: CSI-Kamera konnte nicht angesprochen werden: {e}. Ist "
+                  f"sie korrekt angeschlossen und in raspi-config aktiviert?")
+            sys.exit(1)
 
     cap = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -157,7 +168,8 @@ def video_frame_picker(cap: cv2.VideoCapture, start_idx: int):
     geeignetes Standbild für die Kalibrierung auszuwählen. Bestätigt mit
     Leertaste/Enter.
     """
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    raw_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    total = int(raw_count) if raw_count == raw_count and raw_count > 0 else 0  # raw_count!=raw_count erkennt NaN
     idx = max(0, min(start_idx, total - 1)) if total > 0 else 0
     win = "Video-Standbild waehlen (,/. = zurueck/vor, Leertaste = uebernehmen)"
     cv2.namedWindow(win)
@@ -265,15 +277,6 @@ def main():
             if too_close:
                 continue
 
-            # Sanity-Check 2: wurden zwei Ecken in FALSCHER REIHENFOLGE geklickt
-            # (z.B. oben-rechts und unten-rechts vertauscht)? Das ergibt ein
-            # sich selbst ueberkreuzendes "Bowtie"-Viereck statt eines echten
-            # Rechtecks -- die Perspektiv-Transformation wird dann komplett
-            # unbrauchbar (getestet: das Ergebnisbild wird schlicht schwarz).
-            # Erkennung: die Flaeche des Vierecks IN DER GEKLICKTEN REIHENFOLGE
-            # (Shoelace-Formel) muss der Flaeche der konvexen Huelle derselben
-            # 4 Punkte entsprechen -- bei vertauschter Reihenfolge weichen
-            # beide deutlich voneinander ab.
             pts_arr = np.array(calib.points, dtype=np.float32)
             shoelace_area = 0.0
             for i in range(4):
@@ -283,7 +286,35 @@ def main():
             shoelace_area = abs(shoelace_area) / 2.0
             hull = cv2.convexHull(pts_arr)
             hull_area = cv2.contourArea(hull)
-            if hull_area > 0 and shoelace_area < 0.8 * hull_area:
+
+            # Sanity-Check 2b: Ist die Flaeche des Vierecks ueberhaupt
+            # sinnvoll gross? Vier nahezu kollineare Punkte (z.B. alle 4 fast
+            # auf einer Linie) fallen weder durch den Mindestabstand-Check
+            # (Punkte koennen weit auseinander liegen) noch durch den
+            # folgenden Bowtie-Check (beide Flaechen sind dann fast gleich
+            # UND fast Null) - das Ergebnis waere aber ein komplett leeres,
+            # unbrauchbares entzerrtes Bild (im Testprotokoll reproduziert:
+            # 0 sichtbare Pixel). Deshalb zusaetzlich eine Mindestflaeche
+            # relativ zur Bildgroesse verlangen.
+            frame_area = calib.frame.shape[0] * calib.frame.shape[1]
+            if hull_area < 0.01 * frame_area:
+                print("WARNUNG: Die 4 Punkte umschliessen eine verdaechtig "
+                      "kleine/entartete Flaeche (liegen fast auf einer Linie). "
+                      "Das wuerde ein leeres, unbrauchbares Ergebnisbild "
+                      "erzeugen. Mit 'r' zuruecknehmen und die 4 echten "
+                      "Tischecken neu anklicken.")
+                continue
+
+            # Sanity-Check 2: wurden zwei Ecken in FALSCHER REIHENFOLGE geklickt
+            # (z.B. oben-rechts und unten-rechts vertauscht)? Das ergibt ein
+            # sich selbst ueberkreuzendes "Bowtie"-Viereck statt eines echten
+            # Rechtecks -- die Perspektiv-Transformation wird dann komplett
+            # unbrauchbar (getestet: das Ergebnisbild wird schlicht schwarz).
+            # Erkennung: die Flaeche des Vierecks IN DER GEKLICKTEN REIHENFOLGE
+            # (Shoelace-Formel) muss der Flaeche der konvexen Huelle derselben
+            # 4 Punkte entsprechen -- bei vertauschter Reihenfolge weichen
+            # beide deutlich voneinander ab.
+            if shoelace_area < 0.8 * hull_area:
                 print("WARNUNG: Die 4 Punkte scheinen in FALSCHER REIHENFOLGE "
                       "geklickt zu sein (ueberkreuztes statt einfaches Viereck) "
                       "- vermutlich wurden zwei Ecken vertauscht. Das wuerde die "
