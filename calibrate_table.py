@@ -124,6 +124,10 @@ def grab_frame(args):
         return frame
 
     if args.picamera2:
+        if args.width <= 0 or args.height <= 0:
+            print(f"FEHLER: --width/--height muessen positiv sein (waren: "
+                  f"{args.width}/{args.height}).")
+            sys.exit(1)
         try:
             from picamera2 import Picamera2  # type: ignore
             cam = Picamera2()

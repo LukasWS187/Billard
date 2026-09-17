@@ -1072,11 +1072,26 @@ def main():
               f"alle mm-Umrechnungen (Bandenkontakt, Taschenerkennung) stillschweigend "
               f"falsch, ohne dass ein Fehler sichtbar wuerde.")
         sys.exit(1)
-    if args.player_names[0] == args.player_names[1]:
-        print(f"HINWEIS: Beide Spieler heissen '{args.player_names[0]}' - die "
+    if args.width <= 0 or args.height <= 0:
+        print(f"FEHLER: --width/--height (Kamera-Aufloesung) muessen positiv "
+              f"sein (waren: {args.width}/{args.height}).")
+        sys.exit(1)
+    if args.fps <= 0:
+        print(f"FEHLER: --fps muss positiv sein (war: {args.fps}).")
+        sys.exit(1)
+    if args.picamera2 and args.device != 0:
+        print(f"HINWEIS: --picamera2 ist gesetzt, --device wird dabei ignoriert "
+              f"(nur fuer den V4L2/USB-Pfad relevant).")
+    if not args.player_names[0].strip() or not args.player_names[1].strip():
+        print(f"FEHLER: Spielernamen duerfen nicht leer sein (waren: "
+              f"{args.player_names!r}).")
+        sys.exit(1)
+    if args.player_names[0].strip().lower() == args.player_names[1].strip().lower():
+        print(f"HINWEIS: Beide Spieler heissen '{args.player_names[0]}' (oder "
+              f"nur in Gross-/Kleinschreibung/Leerzeichen unterschiedlich) - die "
               f"Spielverfolgung selbst bleibt korrekt, aber die finale "
               f"Sieger-Meldung waere nicht mehr eindeutig lesbar. Empfehlung: "
-              f"--player-names mit zwei unterschiedlichen Namen angeben.")
+              f"--player-names mit zwei klar unterschiedlichen Namen angeben.")
 
     corners = _load_corners(args.calibration, args.corners)
     table_config = TableConfig(corners_px=corners, table_w_mm=args.table_w_mm,
